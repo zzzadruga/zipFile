@@ -1,0 +1,91 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+    Copyright 2014-2017, Red Hat, Inc. and/or its affiliates, and individual
+    contributors by the @authors tag. 
+
+    Licensed under the Apache License, Version 2.0 (the "License");
+    you may not use this file except in compliance with the License.
+    You may obtain a copy of the License at
+    http://www.apache.org/licenses/LICENSE-2.0
+    Unless required by applicable law or agreed to in writing, software
+    distributed under the License is distributed on an "AS IS" BASIS,
+    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+    See the License for the specific language governing permissions and
+    limitations under the License.
+-->
+<!-- Configures the Camel Context-->
+<beans xmlns="http://www.springframework.org/schema/beans"
+    xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="        http://www.springframework.org/schema/beans http://www.springframework.org/schema/beans/spring-beans.xsd        http://camel.apache.org/schema/spring http://camel.apache.org/schema/spring/camel-spring.xsd">
+    <bean class="ru.bipartner.CheckZipArchive" id="checkArchive"/>
+    <bean class="org.apache.camel.dataformat.zipfile.ZipSplitter" id="zipSplitter"/>
+        <bean
+        class="org.springframework.jdbc.datasource.SimpleDriverDataSource" id="dataSource">
+        <property name="driverClass" value="com.microsoft.sqlserver.jdbc.SQLServerDriver"/>
+        <property name="url" value="jdbc:sqlserver://***.***.***.***:****;databaseName=**********;"/>
+        <property name="username" value="**********"/>
+        <property name="password" value="**********"/>
+    </bean>
+    <bean class="org.apache.activemq.ActiveMQConnectionFactory" id="activemq-connection-factory">
+        <property name="brokerURL" value="vm://amq?broker.persistent=false"/>
+        <property name="userName" value="admin"/>
+        <property name="password" value="admin"/>
+    </bean>
+    <bean class="org.apache.activemq.camel.component.ActiveMQComponent" id="activemq">
+        <property name="configuration">
+            <bean class="org.apache.activemq.camel.component.ActiveMQConfiguration">
+                <property name="connectionFactory" ref="activemq-connection-factory"/>
+            </bean>
+        </property>
+    </bean>
+    <camelContext id="_camelContextZipFile" xmlns="http://camel.apache.org/schema/spring">
+        <route id="zipFile">
+            <from id="_inputDirectory" uri="file:work/cbr/input?moveFailed=error&amp;delay=5000"/>
+            <log id="_logUnzipStart" logName="UNZIP" message="Unziping the &quot;${file:name}&quot; file is started"/>
+            <to id="_zipFileInsertIntoD_FILE" uri="sql:SET NOCOUNT ON;INSERT INTO [dbo].[D_FILE] ([Parent_ID],[Name],[Input],[Output],[Extension]) VALUES (0,:#${file:name},:#${file:parent},:#${file:parent},'.zip');SELECT SCOPE_IDENTITY() AS 'ID';?dataSource=#dataSource&amp;outputHeader=ID&amp;transacted=true&amp;exchangePattern=InOut"/>
+            <setHeader headerName="timeToStartUnzip" id="_setTimeToStartUnzip">
+                <simple>${date:now:yyyy-MM-dd hh:mm:ss.SSS}</simple>
+            </setHeader>
+            <setHeader headerName="parentID" id="_setParentID">
+                <simple>${header.ID[0]['ID']}</simple>
+            </setHeader>
+            <to id="_zipFileInsertIntoLOG_ACTIONStart" uri="sql:SET NOCOUNT ON;INSERT INTO [dbo].[LOG_ACTION] ([File_ID],[Action_name_ID],[Status_ID],[Start_time]) VALUES (:#${header.parentID},1,1,:#${header.timeToStartUnzip});?dataSource=#dataSource"/>
+            <doTry id="_doTry">
+                <process id="_checkArchive" ref="checkArchive"/>
+                <setHeader headerName="directory" id="_setExtractDirectory">
+                    <simple>extract-files</simple>
+                </setHeader>
+                <split id="_zipSplit" streaming="true">
+                    <ref>zipSplitter</ref>
+                    <convertBodyTo id="_convertBodyToStringAfterUnzip" type="java.lang.String"/>
+                    <log id="_extractStart" logName="EXTRACT" message="Extracting the &quot;${file:name}&quot; file is started"/>
+                    <setHeader headerName="timeToStartExtract" id="_setTimeToStartExtract">
+                        <simple>${date:now:yyyy-MM-dd hh:mm:ss.SSS}</simple>
+                    </setHeader>
+                    <to id="_zipSplitInsertIntoD_FILE" uri="sql:SET NOCOUNT ON;INSERT INTO [dbo].[D_FILE] ([Parent_ID],[Name],[Input],[Output],[Extension]) VALUES (:#${header.parentID},:#${file:name},:#${file:parent},:#${file:parent},'.xml');SELECT SCOPE_IDENTITY() AS 'ID';?dataSource=#dataSource&amp;outputHeader=ID&amp;transacted=true&amp;exchangePattern=InOut"/>
+                    <setHeader headerName="rowID" id="_setHeaderRowID">
+                        <simple>${header.ID[0]['ID']}</simple>
+                    </setHeader>
+                    <setHeader headerName="fileName" id="_setUnzipFileName">
+                        <simple>${file:name}</simple>
+                    </setHeader>
+                    <to id="_zipSplitInsertIntoLOG_ACTION" uri="sql:SET NOCOUNT ON;INSERT INTO [dbo].[LOG_ACTION] ([File_ID],[Action_name_ID],[Status_ID],[Start_time]) VALUES (:#${header.rowID},6,1,:#${header.timeToStartExtract});?dataSource=#dataSource"/>
+                    <to id="_toQueueParseAfterUnzip" uri="activemq:queue:parse"/>
+                    <to id="_zipSplitUpdateLOG_ACTION" uri="sql:UPDATE [dbo].[LOG_ACTION] SET [Status_ID] = 2,[End_time]=:#${date:now:yyyy-MM-dd hh:mm:ss.SSS} WHERE [File_ID] = :#${header.rowID} AND [Start_time] = :#${header.timeToStartExtract};?dataSource=#dataSource"/>
+                    <log id="_extractComplete" logName="EXTRACT" message="Extracting the &quot;${file:name}&quot; file is complete"/>
+                </split>
+                <to id="_zipFileUpdateLOG_ACTIONFinish" uri="sql:UPDATE [dbo].[LOG_ACTION] SET [Status_ID] = 2,[End_time]=:#${date:now:yyyy-MM-dd hh:mm:ss.SSS} WHERE [File_ID] = :#${header.parentID} AND [Start_time] = :#${header.timeToStartUnzip};?dataSource=#dataSource"/>
+                <log id="_unzipComplete" logName="UNZIP" message="Unziping the &quot;${file:name}&quot; file is complete"/>
+                <to id="_to2" uri="file:work/cbr/zip-archives"/>
+                <doCatch id="_doCatch">
+                    <exception>java.lang.Throwable</exception>
+                    <handled>
+                        <constant>true</constant>
+                    </handled>
+                    <to id="_zipFileUpdateLOG_ACTIONError" uri="sql:UPDATE [dbo].[LOG_ACTION] SET [Status_ID] = 3,[End_time]=:#${date:now:yyyy-MM-dd hh:mm:ss.SSS} WHERE [File_ID] = :#${header.parentID} AND [Start_time] = :#${header.timeToStartUnzip};?dataSource=#dataSource"/>
+                    <log id="_unzipError" logName="UNZIP" message="Error!"/>
+                    <to id="_to1" uri="file:work/cbr/error"/>
+                </doCatch>
+            </doTry>
+        </route>
+    </camelContext>
+</beans>
